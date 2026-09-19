@@ -1,0 +1,396 @@
+{
+  "info": {
+    "_postman_id": "hotel-offer-orchestrator-v1",
+    "name": "Hotel Offer Orchestrator",
+    "description": "Complete test suite for the Hotel Offer Orchestrator API.\n\nSet the `base_url` collection variable before running.\nDefault: http://localhost:3000",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url", "value": "http://localhost:3000", "type": "string" }
+  ],
+  "item": [
+    {
+      "name": "Hotels API",
+      "item": [
+        {
+          "name": "1. Valid city — full list",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Returns array', () => pm.expect(pm.response.json()).to.be.an('array'));",
+                  "pm.test('Delhi returns 24 deduplicated hotels', () => pm.expect(pm.response.json()).to.have.lengthOf(24));",
+                  "pm.test('Has correlation ID header', () => pm.response.to.have.header('X-Correlation-Id'));",
+                  "pm.test('Has cache header', () => pm.response.to.have.header('X-Cache'));",
+                  "pm.test('Hotels have required fields', () => {",
+                  "  const hotels = pm.response.json();",
+                  "  pm.expect(hotels.length).to.be.greaterThan(0);",
+                  "  hotels.forEach(h => {",
+                  "    pm.expect(h).to.have.all.keys('name', 'price', 'supplier', 'commissionPct');",
+                  "    pm.expect(h.price).to.be.a('number');",
+                  "    pm.expect(h.supplier).to.be.oneOf(['Supplier A', 'Supplier B']);",
+                  "  });",
+                  "});",
+                  "pm.test('Hotels are sorted by price ascending', () => {",
+                  "  const hotels = pm.response.json();",
+                  "  for (let i = 1; i < hotels.length; i++) {",
+                  "    pm.expect(hotels[i].price).to.be.at.least(hotels[i-1].price);",
+                  "  }",
+                  "});",
+                  "pm.test('Deduplication: Holtin winner is Supplier B (5340 < 6000)', () => {",
+                  "  const holtin = pm.response.json().find(h => h.name === 'Holtin');",
+                  "  if (holtin) {",
+                  "    pm.expect(holtin.price).to.equal(5340);",
+                  "    pm.expect(holtin.supplier).to.equal('Supplier B');",
+                  "  }",
+                  "});",
+                  "pm.test('Deduplication: Radison winner is Supplier A (5900 < 6400)', () => {",
+                  "  const radison = pm.response.json().find(h => h.name === 'Radison');",
+                  "  if (radison) {",
+                  "    pm.expect(radison.price).to.equal(5900);",
+                  "    pm.expect(radison.supplier).to.equal('Supplier A');",
+                  "  }",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/hotels?city=delhi",
+            "description": "On a cold cache this triggers the Temporal workflow and populates Redis. It returns X-Cache: HIT when the city is already cached."
+          }
+        },
+        {
+          "name": "2. Same city — cache HIT",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "pm.test('X-Cache is HIT', () => pm.expect(pm.response.headers.get('X-Cache')).to.equal('HIT'));",
+                  "pm.test('Response is fast (< 100ms)', () => pm.expect(pm.response.responseTime).to.be.below(100));"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/hotels?city=delhi",
+            "description": "Second call to the same city — served from Redis cache. X-Cache should be HIT."
+          }
+        },
+        {
+          "name": "3. Price range filter (minPrice + maxPrice)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "pm.test('All hotels within price range', () => {",
+                  "  pm.response.json().forEach(h => {",
+                  "    pm.expect(h.price).to.be.at.least(4000);",
+                  "    pm.expect(h.price).to.be.at.most(9000);",
+                  "  });",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/hotels?city=delhi&minPrice=4000&maxPrice=9000"
+          }
+        },
+        {
+          "name": "4. Min price only filter",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "pm.test('All hotels above minPrice', () => {",
+                  "  pm.response.json().forEach(h => pm.expect(h.price).to.be.at.least(10000));",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/hotels?city=delhi&minPrice=10000"
+          }
+        },
+        {
+          "name": "5. Max price only filter",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "pm.test('All hotels below maxPrice', () => {",
+                  "  pm.response.json().forEach(h => pm.expect(h.price).to.be.at.most(5500));",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/hotels?city=delhi&maxPrice=5500"
+          }
+        },
+        {
+          "name": "6. City with no results",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Unknown city returns an empty array', () => {",
+                  "  pm.expect(pm.response.json()).to.be.an('array').that.is.empty;",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/hotels?city=unknowncity",
+            "description": "City not found in either supplier — should return empty or 404."
+          }
+        },
+        {
+          "name": "7. Missing city param → 400",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 400', () => pm.response.to.have.status(400));",
+                  "pm.test('Error body has code field', () => {",
+                  "  pm.expect(pm.response.json()).to.have.property('code');",
+                  "});",
+                  "pm.test('Has correlation ID', () => pm.response.to.have.header('X-Correlation-Id'));"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/hotels",
+            "description": "Missing required `city` param — must return 400."
+          }
+        },
+        {
+          "name": "8. Invalid price param → 400",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 400', () => pm.response.to.have.status(400));",
+                  "pm.test('Error mentions minPrice', () => {",
+                  "  pm.expect(pm.response.json().error).to.include('minPrice');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/hotels?city=delhi&minPrice=abc"
+          }
+        },
+        {
+          "name": "9. minPrice > maxPrice → 400",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 400', () => pm.response.to.have.status(400));",
+                  "pm.test('Error mentions price range', () => {",
+                  "  pm.expect(pm.response.json().code).to.equal('INVALID_PRICE_RANGE');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/hotels?city=delhi&minPrice=9000&maxPrice=4000"
+          }
+        },
+        {
+          "name": "10. Mumbai city",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Returns hotels for Mumbai', () => pm.expect(pm.response.json().length).to.be.greaterThan(0));"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/api/hotels?city=mumbai"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Mock Supplier Endpoints",
+      "item": [
+        {
+          "name": "Supplier A — Delhi hotels",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Returns array with raw supplier format', () => {",
+                  "  pm.response.json().forEach(h => {",
+                  "    pm.expect(h).to.have.all.keys('hotelId', 'name', 'price', 'city', 'commissionPct');",
+                  "  });",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/supplierA/hotels?city=delhi"
+          }
+        },
+        {
+          "name": "Supplier B — Delhi hotels",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Returns array with raw supplier format', () => {",
+                  "  pm.response.json().forEach(h => {",
+                  "    pm.expect(h).to.have.all.keys('hotelId', 'name', 'price', 'city', 'commissionPct');",
+                  "  });",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/supplierB/hotels?city=delhi"
+          }
+        },
+        {
+          "name": "Simulate Supplier B DOWN",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 503 when simulated down', () => pm.response.to.have.status(503));"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/supplierB/hotels?city=delhi",
+            "header": [
+              { "key": "X-Simulate-Down", "value": "true" }
+            ],
+            "description": "Send X-Simulate-Down: true to force Supplier B to return 503."
+          }
+        },
+        {
+          "name": "Simulate Supplier A DOWN",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 503 when simulated down', () => pm.response.to.have.status(503));"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/supplierA/hotels?city=delhi",
+            "header": [
+              { "key": "X-Simulate-Down", "value": "true" }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Health Check",
+      "item": [
+        {
+          "name": "Health — all dependencies",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status is 200 or 207', () => pm.expect(pm.response.code).to.be.oneOf([200, 207]));",
+                  "pm.test('Response has status field', () => {",
+                  "  pm.expect(pm.response.json()).to.have.property('status');",
+                  "});",
+                  "pm.test('Response has dependencies', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.dependencies).to.have.all.keys('supplierA', 'supplierB', 'temporal', 'redis');",
+                  "});",
+                  "pm.test('Each dependency has status and latencyMs', () => {",
+                  "  Object.values(pm.response.json().dependencies).forEach(dep => {",
+                  "    pm.expect(dep).to.have.property('status');",
+                  "    pm.expect(dep).to.have.property('latencyMs');",
+                  "  });",
+                  "});",
+                  "pm.test('uptime is a positive number', () => {",
+                  "  pm.expect(pm.response.json().uptime).to.be.a('number').and.greaterThan(0);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/health"
+          }
+        }
+      ]
+    }
+  ]
+}
