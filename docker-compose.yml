@@ -1,0 +1,148 @@
+networks:
+  hotel-net:
+    driver: bridge
+
+volumes:
+  redis-data:
+  postgres-data:
+
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: hotel-postgres
+    networks:
+      - hotel-net
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal -d postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ─── Temporal Server using the PostgreSQL service above ──────────────────────
+  temporal:
+    image: temporalio/auto-setup:1.24.2
+    container_name: hotel-temporal
+    networks:
+      - hotel-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "7233:7233"   # Temporal gRPC
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=temporal
+      - POSTGRES_PWD=temporal
+      - POSTGRES_SEEDS=postgres
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CLI_ADDRESS=temporal:7233
+    healthcheck:
+      test: ["CMD", "tctl", "--address", "temporal:7233", "cluster", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ─── Temporal Web UI ─────────────────────────────────────────────────────────
+  temporal-ui:
+    image: temporalio/ui:2.26.2
+    container_name: hotel-temporal-ui
+    networks:
+      - hotel-net
+    ports:
+      - "8080:8080"   # Web UI at http://localhost:8080
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:3000
+    depends_on:
+      temporal:
+        condition: service_healthy
+
+  # ─── Redis 7 ─────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: hotel-redis
+    networks:
+      - hotel-net
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ─── API Server ───────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: hotel-api
+    networks:
+      - hotel-net
+    ports:
+      - "3000:3000"
+    environment:
+      - ROLE=api
+      - NODE_ENV=production
+      - PORT=3000
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_NAMESPACE=default
+      - TEMPORAL_TASK_QUEUE=hotel-offer-queue
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_CACHE_TTL_SECONDS=300
+      - SUPPLIER_A_BASE_URL=http://api:3000
+      - SUPPLIER_B_BASE_URL=http://api:3000
+      - ALLOW_STALE_CACHE=true
+      - SUPPLIER_REQUEST_TIMEOUT_MS=5000
+      - HEALTH_PROBE_TIMEOUT_MS=2000
+    depends_on:
+      temporal:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ─── Temporal Worker ──────────────────────────────────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: hotel-worker
+    networks:
+      - hotel-net
+    environment:
+      - ROLE=worker
+      - NODE_ENV=production
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_NAMESPACE=default
+      - TEMPORAL_TASK_QUEUE=hotel-offer-queue
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - SUPPLIER_A_BASE_URL=http://api:3000
+      - SUPPLIER_B_BASE_URL=http://api:3000
+      - ALLOW_STALE_CACHE=true
+      - SUPPLIER_REQUEST_TIMEOUT_MS=5000
+    depends_on:
+      temporal:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_started
+    restart: unless-stopped
+    healthcheck:
+      disable: true
