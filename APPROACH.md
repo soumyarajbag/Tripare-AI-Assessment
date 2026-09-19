@@ -707,16 +707,16 @@ The Postman collection covers automated assertion tests for every scenario:
 | Test Case                 | Request                                                   | Expected                                     |
 |---|---|---|
 | Valid city, full list     | `GET /api/hotels?city=delhi`                              | 200, 24 deduplicated hotels, X-Cache: MISS on a cold cache |
-| Cache hit verification    | Same request again immediately                            | 200, X-Cache: HIT, faster response time      |
+| Cache hit verification    | Same request again immediately                            | 200, X-Cache: HIT                              |
 | Price range filter        | `GET /api/hotels?city=delhi&minPrice=4000&maxPrice=9000`  | 200, subset of hotels                        |
 | Min price only            | `GET /api/hotels?city=delhi&minPrice=10000`               | 200, only expensive hotels                   |
-| Max price only            | `GET /api/hotels?city=delhi&maxPrice=5000`                | 200, only cheap hotels                       |
+| Max price only            | `GET /api/hotels?city=delhi&maxPrice=5500`                | 200, 3 hotels at or below the maximum         |
 | Empty results             | `GET /api/hotels?city=unknowncity`                        | 200 with `[]`                                |
 | Missing city param        | `GET /api/hotels`                                         | 400 with error message                       |
 | Invalid price param       | `GET /api/hotels?city=delhi&minPrice=abc`                 | 400                                          |
 | Supplier A mock direct    | `GET /supplierA/hotels?city=delhi`                        | 200, raw array                               |
 | Supplier B mock direct    | `GET /supplierB/hotels?city=delhi`                        | 200, raw array                               |
-| Simulate supplier down    | `GET /supplierB/hotels` + header `X-Simulate-Down: true`  | 503                                          |
+| Simulate supplier down    | `GET /supplierB/hotels?city=delhi` + header `X-Simulate-Down: true` | 503                                |
 | Health check              | `GET /health`                                             | 200, all dependencies healthy                |
 
 **Each request has automated test scripts:**

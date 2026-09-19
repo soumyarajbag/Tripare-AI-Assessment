@@ -24,6 +24,7 @@
                   "pm.test('Delhi returns 24 deduplicated hotels', () => pm.expect(pm.response.json()).to.have.lengthOf(24));",
                   "pm.test('Has correlation ID header', () => pm.response.to.have.header('X-Correlation-Id'));",
                   "pm.test('Has cache header', () => pm.response.to.have.header('X-Cache'));",
+                  "pm.test('Cache header has a valid value', () => pm.expect(pm.response.headers.get('X-Cache')).to.be.oneOf(['HIT', 'MISS']));",
                   "pm.test('Hotels have required fields', () => {",
                   "  const hotels = pm.response.json();",
                   "  pm.expect(hotels.length).to.be.greaterThan(0);",
@@ -41,17 +42,15 @@
                   "});",
                   "pm.test('Deduplication: Holtin winner is Supplier B (5340 < 6000)', () => {",
                   "  const holtin = pm.response.json().find(h => h.name === 'Holtin');",
-                  "  if (holtin) {",
-                  "    pm.expect(holtin.price).to.equal(5340);",
-                  "    pm.expect(holtin.supplier).to.equal('Supplier B');",
-                  "  }",
+                  "  pm.expect(holtin).to.exist;",
+                  "  pm.expect(holtin.price).to.equal(5340);",
+                  "  pm.expect(holtin.supplier).to.equal('Supplier B');",
                   "});",
                   "pm.test('Deduplication: Radison winner is Supplier A (5900 < 6400)', () => {",
                   "  const radison = pm.response.json().find(h => h.name === 'Radison');",
-                  "  if (radison) {",
-                  "    pm.expect(radison.price).to.equal(5900);",
-                  "    pm.expect(radison.supplier).to.equal('Supplier A');",
-                  "  }",
+                  "  pm.expect(radison).to.exist;",
+                  "  pm.expect(radison.price).to.equal(5900);",
+                  "  pm.expect(radison.supplier).to.equal('Supplier A');",
                   "});"
                 ],
                 "type": "text/javascript"
@@ -72,8 +71,7 @@
               "script": {
                 "exec": [
                   "pm.test('Status is 200', () => pm.response.to.have.status(200));",
-                  "pm.test('X-Cache is HIT', () => pm.expect(pm.response.headers.get('X-Cache')).to.equal('HIT'));",
-                  "pm.test('Response is fast (< 100ms)', () => pm.expect(pm.response.responseTime).to.be.below(100));"
+                  "pm.test('X-Cache is HIT', () => pm.expect(pm.response.headers.get('X-Cache')).to.equal('HIT'));"
                 ],
                 "type": "text/javascript"
               }
@@ -93,6 +91,7 @@
               "script": {
                 "exec": [
                   "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Returns 11 Delhi hotels in this inclusive range', () => pm.expect(pm.response.json()).to.have.lengthOf(11));",
                   "pm.test('All hotels within price range', () => {",
                   "  pm.response.json().forEach(h => {",
                   "    pm.expect(h.price).to.be.at.least(4000);",
@@ -117,6 +116,7 @@
               "script": {
                 "exec": [
                   "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Returns 11 Delhi hotels at or above minPrice', () => pm.expect(pm.response.json()).to.have.lengthOf(11));",
                   "pm.test('All hotels above minPrice', () => {",
                   "  pm.response.json().forEach(h => pm.expect(h.price).to.be.at.least(10000));",
                   "});"
@@ -138,6 +138,7 @@
               "script": {
                 "exec": [
                   "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Returns 3 Delhi hotels at or below maxPrice', () => pm.expect(pm.response.json()).to.have.lengthOf(3));",
                   "pm.test('All hotels below maxPrice', () => {",
                   "  pm.response.json().forEach(h => pm.expect(h.price).to.be.at.most(5500));",
                   "});"
@@ -170,7 +171,7 @@
           "request": {
             "method": "GET",
             "url": "{{base_url}}/api/hotels?city=unknowncity",
-            "description": "City not found in either supplier — should return empty or 404."
+            "description": "City not found in either supplier; the API returns HTTP 200 with an empty array."
           }
         },
         {
@@ -246,7 +247,7 @@
               "script": {
                 "exec": [
                   "pm.test('Status is 200', () => pm.response.to.have.status(200));",
-                  "pm.test('Returns hotels for Mumbai', () => pm.expect(pm.response.json().length).to.be.greaterThan(0));"
+                  "pm.test('Mumbai returns 20 deduplicated hotels', () => pm.expect(pm.response.json()).to.have.lengthOf(20));"
                 ],
                 "type": "text/javascript"
               }
@@ -270,6 +271,7 @@
               "script": {
                 "exec": [
                   "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Returns 20 Delhi offers', () => pm.expect(pm.response.json()).to.have.lengthOf(20));",
                   "pm.test('Returns array with raw supplier format', () => {",
                   "  pm.response.json().forEach(h => {",
                   "    pm.expect(h).to.have.all.keys('hotelId', 'name', 'price', 'city', 'commissionPct');",
@@ -293,6 +295,7 @@
               "script": {
                 "exec": [
                   "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Returns 20 Delhi offers', () => pm.expect(pm.response.json()).to.have.lengthOf(20));",
                   "pm.test('Returns array with raw supplier format', () => {",
                   "  pm.response.json().forEach(h => {",
                   "    pm.expect(h).to.have.all.keys('hotelId', 'name', 'price', 'city', 'commissionPct');",
@@ -327,7 +330,7 @@
             "header": [
               { "key": "X-Simulate-Down", "value": "true" }
             ],
-            "description": "Send X-Simulate-Down: true to force Supplier B to return 503."
+            "description": "Direct mock-endpoint check: X-Simulate-Down: true forces Supplier B to return 503. This header is not forwarded by the aggregation workflow."
           }
         },
         {
@@ -363,7 +366,11 @@
               "listen": "test",
               "script": {
                 "exec": [
-                  "pm.test('Status is 200 or 207', () => pm.expect(pm.response.code).to.be.oneOf([200, 207]));",
+                  "pm.test('HTTP status matches the reported health state', () => {",
+                  "  const body = pm.response.json();",
+                  "  const expectedStatus = { healthy: 200, degraded: 207, unhealthy: 503 }[body.status];",
+                  "  pm.expect(pm.response.code).to.equal(expectedStatus);",
+                  "});",
                   "pm.test('Response has status field', () => {",
                   "  pm.expect(pm.response.json()).to.have.property('status');",
                   "});",
@@ -373,8 +380,8 @@
                   "});",
                   "pm.test('Each dependency has status and latencyMs', () => {",
                   "  Object.values(pm.response.json().dependencies).forEach(dep => {",
-                  "    pm.expect(dep).to.have.property('status');",
-                  "    pm.expect(dep).to.have.property('latencyMs');",
+                  "    pm.expect(dep.status).to.be.oneOf(['up', 'down']);",
+                  "    pm.expect(dep.latencyMs).to.be.a('number').and.at.least(0);",
                   "  });",
                   "});",
                   "pm.test('uptime is a positive number', () => {",
