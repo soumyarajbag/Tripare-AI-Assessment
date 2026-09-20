@@ -44,6 +44,115 @@ Compose starts the API and Temporal worker, a Temporal server backed by PostgreS
 | Temporal Web UI | http://localhost:8080 |
 | Redis | localhost:6379 |
 
+## Temporal UI Demo Walkthrough
+
+The screenshots below show a completed `HotelAggregatorWorkflow` execution in the Temporal Web UI. To follow the same flow yourself, start the Docker Compose stack, then send `GET http://localhost:3000/api/hotels?city=mumbai` from Postman or curl. On a cache miss, the API starts the workflow and waits for its result. The result is then written to Redis. A later request served from Redis does not create a new workflow execution, so use a city whose cache has expired (the default TTL is five minutes) when you want to watch a fresh run.
+
+Open [Temporal Web UI](http://localhost:8080), select the `default` namespace, and choose **Workflows** in the left navigation.
+
+### 1. Find the execution
+
+![Temporal Workflows list showing completed hotel aggregation executions](screenshots/Workflows.png)
+
+The list shows completed runs, their Workflow IDs, run IDs, workflow type, and start/end times. The ID follows `hotel-aggregator-<city>`; the screenshot includes Delhi, Mumbai, and unknown-city runs. Select `hotel-aggregator-mumbai` to inspect the Mumbai execution shown in the remaining screenshots.
+
+### 2. Review workflow summary and parallel activity timeline
+
+![Completed Mumbai workflow summary and activity timeline in Temporal](screenshots/Workflow%20Overview.png)
+
+The workflow detail page identifies the workflow type (`HotelAggregatorWorkflow`), task queue (`hotel-offer-queue`), run ID, completion status, and duration. In the **Timeline**, `fetchFromSupplierA` and `fetchFromSupplierB` appear as separate activity rows whose execution intervals overlap. This is the Temporal UI view of the two supplier calls being scheduled concurrently.
+
+### 3. Inspect the workflow input and result
+
+![Temporal workflow Input and Results panel for the Mumbai execution](screenshots/Workflow%20Overview%202.png)
+
+Expand **Input and Results** on the workflow detail page. The input contains the requested city (`mumbai`) and a correlation ID. The result is the final de-duplicated hotel array returned by the workflow; the visible beginning includes `Juhu Residency`, `Marrine`, and `The Fern Goregaon` with the selected prices and supplier names.
+
+### 4. Trace the event history
+
+![Temporal event history showing workflow and supplier activity events](screenshots/Workflow%20Overview%203.png)
+
+The **Event History** records the execution lifecycle: `WorkflowExecutionStarted`, workflow task events, activity scheduling and completion, and finally `WorkflowExecutionCompleted`. The two supplier activity scheduling events are separate entries. Use this history to verify that both activity results were collected before the workflow completed.
+
+### 5. Expand the workflow completion result
+
+![Expanded WorkflowExecutionCompleted result in Temporal event history](screenshots/Workflow%20Overview%204.png)
+
+Expanding `WorkflowExecutionCompleted` shows the array returned by the workflow. For this Mumbai run, the result starts with `Juhu Residency` at 3,900 from Supplier A, `Marrine` at 5,200 from Supplier B, and `The Fern Goregaon` at 6,500 from Supplier A. The public API returns this same result shape, without the supplier fixture's internal `hotelId` and `city` fields.
+
+### 6. Inspect raw supplier activity results
+
+![Expanded Temporal activity events showing supplier results](screenshots/Workflow%20Overview%205.png)
+
+Expand each `ActivityTaskCompleted` event to see the raw offers returned by the corresponding supplier activity. These payloads include `hotelId`, `name`, `price`, `commissionPct`, and `city`. Comparing the two activity results with the workflow completion result lets you verify that overlapping names were resolved to the lower-priced offer and supplier-only hotels were retained.
+
+Temporal event timestamps in these saved screenshots are in UTC and represent the captured demo run. New executions will have different run IDs, timestamps, and correlation IDs.
+
+## Architecture Explained
+
+The demo follows the same path as a real request: Express handles the HTTP boundary, the application service coordinates cache and workflow work, Temporal runs durable orchestration, and Redis stores the completed offers for fast reads. The supplier APIs are local mock endpoints so the flow can be run without external accounts or API keys.
+
+```mermaid
+flowchart TD
+    Client[Postman or client] -->|GET /api/hotels| Route[Express route]
+    Route --> Controller[Hotels controller<br/>validate city and price bounds]
+    Controller --> Service[Hotel aggregation service]
+
+    Service -->|cache lookup| Redis[(Redis)]
+    Redis -->|cache hit<br/>ZRANGEBYSCORE filter| Service
+    Redis -->|cache miss| TemporalClient[Temporal client]
+
+    TemporalClient --> TemporalServer[Temporal server]
+    TemporalServer -->|hotel-offer-queue| Worker[Temporal worker]
+    Worker --> Workflow[HotelAggregatorWorkflow]
+    Workflow -->|parallel activity tasks| ActivityA[Supplier A activity]
+    Workflow -->|parallel activity tasks| ActivityB[Supplier B activity]
+
+    ActivityA -->|HTTP GET| MockA[Supplier A mock route]
+    ActivityB -->|HTTP GET| MockB[Supplier B mock route]
+    MockA --> DataA[(Static Supplier A data)]
+    MockB --> DataB[(Static Supplier B data)]
+    DataA --> ActivityA
+    DataB --> ActivityB
+
+    ActivityA -->|offers| Workflow
+    ActivityB -->|offers| Workflow
+    Workflow -->|dedupe and choose cheapest| TemporalServer
+    TemporalServer -->|workflow completion| TemporalClient
+    TemporalClient -->|workflow result| Service
+    Service -->|write sorted set and metadata<br/>then query price range| Redis
+    Redis -->|filtered hotel list| Service
+    Service --> Controller
+    Controller --> Client
+
+    TemporalServer -. persists workflow history .-> Postgres[(PostgreSQL)]
+```
+
+### What each part does
+
+| Component | Responsibility |
+|---|---|
+| Express routes and controllers | The hotels request is split across `src/api/routes/hotels.route.ts` -> `src/api/controllers/hotels.controller.ts` -> `src/services/hotelAggregator.service.ts`. The route maps the URL to its controller; the controller normalizes and validates query parameters, calls the service, and maps the result or error to HTTP. Correlation middleware adds `X-Correlation-Id` for tracing. |
+| Hotel aggregation service | Checks Redis first. On a cache miss it starts or joins the city's Temporal workflow, waits for the result, saves the full deduplicated list, and queries Redis again with the requested price bounds. It can serve a stale snapshot if workflow execution fails and stale-cache support is enabled. |
+| Temporal server | Accepts workflow starts, records workflow history durably in PostgreSQL, and dispatches workflow and activity tasks through the configured task queue. The server coordinates execution; it does not call the suppliers itself. |
+| Temporal worker and workflow | The worker in `src/temporal/worker.ts` polls `hotel-offer-queue` and executes `HotelAggregatorWorkflow` from `src/temporal/workflows/`. The workflow schedules Supplier A and Supplier B activities concurrently, waits for their outcomes, then deduplicates by normalized hotel name and returns the cheaper offer. A listing supplied by only one supplier is retained. |
+| Supplier activities and mock routes | Activities in `src/temporal/activities/supplierActivities.ts` perform HTTP requests to `/supplierA/hotels` and `/supplierB/hotels`, validate the returned offer fields, and report failures to Temporal. The local routes read static fixtures from `src/data/mockSupplierData.ts`. |
+| Redis | Stores each city's selected hotels in a sorted set, using price as the score and the serialized hotel as the member. `ZRANGEBYSCORE` applies inclusive minimum and maximum filters in Redis. Cache metadata uses the configured TTL (five minutes by default); the separate last-good snapshot is retained for up to 24 hours for stale fallback. |
+| PostgreSQL | Stores Temporal's execution history so the Temporal UI can show workflow inputs, activity events, outputs, status, and timing after a run completes. |
+| Temporal Web UI | Reads Temporal history for operators and reviewers. It visualizes workflow and activity execution; it is not in the live API request path. |
+
+### One request, end to end
+
+1. A client calls `GET /api/hotels?city=mumbai&minPrice=4000&maxPrice=10000`. Express middleware assigns a correlation ID; the route sends the request to the controller, which validates and normalizes the query.
+2. The aggregation service asks Redis for that city's data. If the cache exists, Redis returns only the scores in range and the API responds without starting Temporal.
+3. On a cache miss, the service starts `HotelAggregatorWorkflow` with a deterministic ID such as `hotel-aggregator-mumbai` and waits for its result. Concurrent requests for the same city can join the running workflow.
+4. The Temporal worker receives the workflow task from `hotel-offer-queue`. The workflow schedules both supplier activities at once. Each activity makes an HTTP call to its mock route, validates the returned records, and reports its result to the workflow.
+5. The workflow uses the results to select the cheapest offer for each normalized hotel name, keeps supplier-only hotels, sorts by price, and completes. If one supplier fails, the successful supplier's offers can still be returned; if both fail, the workflow fails and the service tries its stale snapshot before returning a service error.
+6. The API service writes the complete selected list to Redis and runs the requested price range through Redis. The controller returns the JSON list with cache, correlation, and available Temporal run headers.
+7. Temporal's event history records the workflow and activity transitions. The screenshots above show how to inspect that history in the Web UI.
+
+In Docker Compose, the API and worker use the same application image with separate roles (`ROLE=api` and `ROLE=worker`). The API serves both the public hotel endpoint and the two mock supplier endpoints; the worker reaches those endpoints over the Compose network. Temporal, PostgreSQL, Redis, the API, and the worker are separate services, so the workflow worker can be scaled independently from HTTP traffic.
+
 ---
 
 ## Local Development (without Docker)
@@ -164,6 +273,215 @@ Requests and assertions included:
 - Health check dependency structure
 - Supplier failure simulation
 
+### Postman request guide
+
+The collection contains 15 requests. Every request uses **GET**, has **no request body**, and uses the `base_url` collection variable (default `http://localhost:3000`). Query parameters shown below are part of each request URL. Only the two supplier outage checks send an extra header.
+
+| # | Collection request | URL / query parameters | Extra headers | Expected response |
+|---:|---|---|---|---|
+| 1 | Valid city — full list | `GET {{base_url}}/api/hotels?city=delhi` | None | `200`; 24 deduplicated hotel objects sorted by price ascending. `X-Cache` is `HIT` or `MISS`, and `X-Correlation-Id` is present. |
+| 2 | Same city — cache HIT | `GET {{base_url}}/api/hotels?city=delhi` | None | `200`; same 24 hotels; `X-Cache: HIT` because request 1 populated Redis. Run after request 1 without waiting for the cache TTL to expire. |
+| 3 | Price range filter | `GET {{base_url}}/api/hotels?city=delhi&minPrice=4000&maxPrice=9000` | None | `200`; 11 hotels, including both boundaries, with prices from 4,000 through 9,000. Redis applies the range with `ZRANGEBYSCORE` when the cache is available. |
+| 4 | Minimum price only | `GET {{base_url}}/api/hotels?city=delhi&minPrice=10000` | None | `200`; 11 hotels, all priced at least 10,000. |
+| 5 | Maximum price only | `GET {{base_url}}/api/hotels?city=delhi&maxPrice=5500` | None | `200`; 3 hotels, all priced at most 5,500. |
+| 6 | City with no results | `GET {{base_url}}/api/hotels?city=unknowncity` | None | `200`; empty JSON array `[]`. |
+| 7 | Missing city | `GET {{base_url}}/api/hotels` | None | `400`; JSON validation error with code `MISSING_CITY`. |
+| 8 | Invalid minimum price | `GET {{base_url}}/api/hotels?city=delhi&minPrice=abc` | None | `400`; JSON validation error with code `INVALID_MIN_PRICE`. |
+| 9 | Reversed price range | `GET {{base_url}}/api/hotels?city=delhi&minPrice=9000&maxPrice=4000` | None | `400`; JSON validation error with code `INVALID_PRICE_RANGE`. |
+| 10 | Mumbai city | `GET {{base_url}}/api/hotels?city=mumbai` | None | `200`; 20 deduplicated hotel objects sorted by price ascending. |
+| 11 | Supplier A — Delhi offers | `GET {{base_url}}/supplierA/hotels?city=delhi` | None | `200`; 20 raw Supplier A offers with `hotelId`, `name`, `price`, `city`, and `commissionPct`. |
+| 12 | Supplier B — Delhi offers | `GET {{base_url}}/supplierB/hotels?city=delhi` | None | `200`; 20 raw Supplier B offers in the same supplier response format. |
+| 13 | Simulate Supplier B down | `GET {{base_url}}/supplierB/hotels?city=delhi` | `X-Simulate-Down: true` | `503`; `{"error":"Supplier B is simulated as down"}`. This calls the mock endpoint directly. |
+| 14 | Simulate Supplier A down | `GET {{base_url}}/supplierA/hotels?city=delhi` | `X-Simulate-Down: true` | `503`; `{"error":"Supplier A is simulated as down"}`. This calls the mock endpoint directly. |
+| 15 | Health — dependencies | `GET {{base_url}}/health` | None | Normally `200` with all dependencies up; `207` when a supplier is down; `503` when Temporal or Redis is down. The body reports the status of both suppliers, Temporal, and Redis. |
+
+### Request and response details
+
+#### Hotel search and price filtering
+
+`city` is required, trimmed, and case-insensitive. `minPrice` and `maxPrice` are optional, non-negative numbers; each bound is inclusive. Supplying both with `minPrice > maxPrice` returns `400`. On normal cache reads and after a successful workflow refresh, Redis applies the range with `ZRANGEBYSCORE`; the service applies the same bounds in TypeScript only as a fallback if Redis cannot serve the result. Successful responses are JSON arrays with this public response shape (supplier `hotelId` and `city` are intentionally omitted):
+
+```json
+{
+  "name": "Holtin",
+  "price": 5340,
+  "supplier": "Supplier B",
+  "commissionPct": 20
+}
+```
+
+The full Delhi response for request 1 is:
+
+```json
+[
+  { "name": "Lemon Tree", "price": 4200, "supplier": "Supplier A", "commissionPct": 15 },
+  { "name": "Hotel Samrat", "price": 5200, "supplier": "Supplier A", "commissionPct": 18 },
+  { "name": "Holtin", "price": 5340, "supplier": "Supplier B", "commissionPct": 20 },
+  { "name": "Radison", "price": 5900, "supplier": "Supplier A", "commissionPct": 13 },
+  { "name": "The Suryaa", "price": 6100, "supplier": "Supplier A", "commissionPct": 16 },
+  { "name": "Lemon Tree Premier", "price": 6800, "supplier": "Supplier A", "commissionPct": 13 },
+  { "name": "The Park New Delhi", "price": 7100, "supplier": "Supplier B", "commissionPct": 16 },
+  { "name": "Radisson Blu Plaza Delhi Airport", "price": 7300, "supplier": "Supplier B", "commissionPct": 16 },
+  { "name": "Eros Hotel", "price": 7900, "supplier": "Supplier A", "commissionPct": 15 },
+  { "name": "The Lalit", "price": 8100, "supplier": "Supplier B", "commissionPct": 18 },
+  { "name": "The Grand New Delhi", "price": 8900, "supplier": "Supplier B", "commissionPct": 13 },
+  { "name": "Hyatt Regency Delhi", "price": 9200, "supplier": "Supplier B", "commissionPct": 13 },
+  { "name": "Le Meridien New Delhi", "price": 9200, "supplier": "Supplier A", "commissionPct": 11 },
+  { "name": "Shangri-La Eros New Delhi", "price": 10500, "supplier": "Supplier A", "commissionPct": 9 },
+  { "name": "Pullman New Delhi Aerocity", "price": 11200, "supplier": "Supplier B", "commissionPct": 11 },
+  { "name": "Taj Palace", "price": 11500, "supplier": "Supplier B", "commissionPct": 9 },
+  { "name": "ITC Maurya", "price": 11500, "supplier": "Supplier A", "commissionPct": 10 },
+  { "name": "Roseate House", "price": 11800, "supplier": "Supplier B", "commissionPct": 10 },
+  { "name": "JW Marriott New Delhi Aerocity", "price": 12900, "supplier": "Supplier B", "commissionPct": 9 },
+  { "name": "The Oberoi", "price": 13800, "supplier": "Supplier B", "commissionPct": 9 },
+  { "name": "The Claridges", "price": 14900, "supplier": "Supplier B", "commissionPct": 11 },
+  { "name": "Andaz Delhi", "price": 15300, "supplier": "Supplier B", "commissionPct": 9 },
+  { "name": "Taj Mahal Hotel", "price": 16500, "supplier": "Supplier B", "commissionPct": 8 },
+  { "name": "The Imperial", "price": 17500, "supplier": "Supplier B", "commissionPct": 8 }
+]
+```
+
+Request 3 returns these 11 entries:
+
+```json
+[
+  { "name": "Lemon Tree", "price": 4200, "supplier": "Supplier A", "commissionPct": 15 },
+  { "name": "Hotel Samrat", "price": 5200, "supplier": "Supplier A", "commissionPct": 18 },
+  { "name": "Holtin", "price": 5340, "supplier": "Supplier B", "commissionPct": 20 },
+  { "name": "Radison", "price": 5900, "supplier": "Supplier A", "commissionPct": 13 },
+  { "name": "The Suryaa", "price": 6100, "supplier": "Supplier A", "commissionPct": 16 },
+  { "name": "Lemon Tree Premier", "price": 6800, "supplier": "Supplier A", "commissionPct": 13 },
+  { "name": "The Park New Delhi", "price": 7100, "supplier": "Supplier B", "commissionPct": 16 },
+  { "name": "Radisson Blu Plaza Delhi Airport", "price": 7300, "supplier": "Supplier B", "commissionPct": 16 },
+  { "name": "Eros Hotel", "price": 7900, "supplier": "Supplier A", "commissionPct": 15 },
+  { "name": "The Lalit", "price": 8100, "supplier": "Supplier B", "commissionPct": 18 },
+  { "name": "The Grand New Delhi", "price": 8900, "supplier": "Supplier B", "commissionPct": 13 }
+]
+```
+
+Requests 4 and 5 return:
+
+Request 4 (`minPrice=10000`) returns 11 hotels:
+
+```json
+[
+  { "name": "Shangri-La Eros New Delhi", "price": 10500, "supplier": "Supplier A", "commissionPct": 9 },
+  { "name": "Pullman New Delhi Aerocity", "price": 11200, "supplier": "Supplier B", "commissionPct": 11 },
+  { "name": "Taj Palace", "price": 11500, "supplier": "Supplier B", "commissionPct": 9 },
+  { "name": "ITC Maurya", "price": 11500, "supplier": "Supplier A", "commissionPct": 10 },
+  { "name": "Roseate House", "price": 11800, "supplier": "Supplier B", "commissionPct": 10 },
+  { "name": "JW Marriott New Delhi Aerocity", "price": 12900, "supplier": "Supplier B", "commissionPct": 9 },
+  { "name": "The Oberoi", "price": 13800, "supplier": "Supplier B", "commissionPct": 9 },
+  { "name": "The Claridges", "price": 14900, "supplier": "Supplier B", "commissionPct": 11 },
+  { "name": "Andaz Delhi", "price": 15300, "supplier": "Supplier B", "commissionPct": 9 },
+  { "name": "Taj Mahal Hotel", "price": 16500, "supplier": "Supplier B", "commissionPct": 8 },
+  { "name": "The Imperial", "price": 17500, "supplier": "Supplier B", "commissionPct": 8 }
+]
+
+```
+
+Request 5 (`maxPrice=5500`) returns 3 hotels:
+
+```json
+[
+  { "name": "Lemon Tree", "price": 4200, "supplier": "Supplier A", "commissionPct": 15 },
+  { "name": "Hotel Samrat", "price": 5200, "supplier": "Supplier A", "commissionPct": 18 },
+  { "name": "Holtin", "price": 5340, "supplier": "Supplier B", "commissionPct": 20 }
+]
+```
+
+#### Validation error responses
+
+All API validation errors include a `correlationId`; the matching `X-Correlation-Id` response header carries the same ID. The ID below is illustrative and changes per request.
+
+Request 7 (missing city, HTTP `400`):
+
+```json
+{
+  "error": "`city` query parameter is required",
+  "code": "MISSING_CITY",
+  "correlationId": "<request-correlation-id>"
+}
+```
+
+Request 8 (invalid `minPrice`, HTTP `400`):
+
+```json
+{
+  "error": "`minPrice` must be a non-negative number",
+  "code": "INVALID_MIN_PRICE",
+  "correlationId": "<request-correlation-id>"
+}
+```
+
+Request 9 (`minPrice` is greater than `maxPrice`, HTTP `400`):
+
+```json
+{
+  "error": "`minPrice` must be less than or equal to `maxPrice`",
+  "code": "INVALID_PRICE_RANGE",
+  "correlationId": "<request-correlation-id>"
+}
+```
+
+Request 6's response body is exactly `[]`. Request 2 has the same array body as request 1, with `X-Cache: HIT`. Other successful `/api/hotels` responses set `X-Cache: HIT | MISS` and `X-Correlation-Id`; a workflow run ID is included in `X-Temporal-Run-Id` when available, and stale cache fallback sets `X-Data-Stale: true`.
+
+#### Mumbai example (request 10)
+
+The response has 20 entries in the same public hotel shape, ordered by price. Its first entries are:
+
+```json
+[
+  { "name": "Juhu Residency", "price": 3900, "supplier": "Supplier A", "commissionPct": 18 },
+  { "name": "Marrine", "price": 5200, "supplier": "Supplier B", "commissionPct": 16 },
+  { "name": "The Fern Goregaon", "price": 6500, "supplier": "Supplier A", "commissionPct": 17 }
+]
+```
+
+This response excerpt shows the first three items; the actual response contains all 20 and is sorted by ascending price. The static source inventory is documented below in `src/data/mockSupplierData.ts`.
+
+#### Direct mock supplier responses (requests 11–14)
+
+Normal supplier requests return the raw offer format, including the supplier-specific ID and city. Each supplier has 20 Delhi offers. For example, Supplier A returns:
+
+```json
+[
+  { "hotelId": "a1", "name": "Holtin", "price": 6000, "city": "delhi", "commissionPct": 10 },
+  { "hotelId": "a2", "name": "Radison", "price": 5900, "city": "delhi", "commissionPct": 13 }
+]
+```
+
+Supplier B returns:
+
+```json
+[
+  { "hotelId": "b1", "name": "Holtin", "price": 5340, "city": "delhi", "commissionPct": 20 },
+  { "hotelId": "b2", "name": "Radison", "price": 6400, "city": "delhi", "commissionPct": 12 }
+]
+```
+
+The examples show the first two records; the actual responses contain all 20 records. The full Delhi, Mumbai, and Bangalore fixtures for both suppliers are maintained in [`src/data/mockSupplierData.ts`](src/data/mockSupplierData.ts). The outage requests return one JSON object and HTTP `503`, for example `{"error":"Supplier B is simulated as down"}`. The simulation header affects only the direct mock endpoint; the aggregation workflow does not forward this header to supplier activities.
+
+#### Health response (request 15)
+
+There is no request body or query parameter. `timestamp`, `uptime`, and each `latencyMs` are live values, so the sample values vary. A healthy response looks like:
+
+```json
+{
+  "status": "healthy",
+  "timestamp": "<ISO-8601 timestamp>",
+  "uptime": 12.34,
+  "dependencies": {
+    "supplierA": { "status": "up", "latencyMs": 3 },
+    "supplierB": { "status": "up", "latencyMs": 4 },
+    "temporal": { "status": "up", "latencyMs": 12 },
+    "redis": { "status": "up", "latencyMs": 1 }
+  }
+}
+```
+
+Each dependency can also include an `error` string when down. Overall status is `degraded` if a supplier is down while Temporal and Redis remain available, and `unhealthy` if Temporal or Redis is down. HTTP status codes are `200`, `207`, and `503` for those states respectively.
+
 ---
 
 ## Project Structure
@@ -238,3 +556,23 @@ Mock inventory includes 20 offers per supplier for Delhi, 15 for Mumbai, and 10 
 | `ALLOW_STALE_CACHE` | `true` | Serve stale data on supplier failure |
 | `SUPPLIER_REQUEST_TIMEOUT_MS` | `5000` | Activity HTTP timeout |
 | `HEALTH_PROBE_TIMEOUT_MS` | `2000` | Health check probe timeout |
+
+---
+
+## AI-Assisted Development
+
+I used AI as a development aid, while keeping the architecture, implementation choices, and verification under my control.
+
+- **Claude Sonnet — initial approach:** I used Claude Sonnet to generate a first-pass breakdown of the assessment and an implementation approach for `APPROACH.md`. I then checked that plan against the required endpoints, Temporal orchestration, Redis price filtering, and Docker submission requirements before treating it as the project plan.
+- **GPT-5 — implementation review and refinement:** I used GPT-5 for targeted help reviewing the route -> controller -> service boundaries, reasoning through parallel supplier activities and partial failures, and keeping the README and Postman collection aligned with the actual code. I used it to explore options and spot gaps; I checked suggested changes against the source before keeping them.
+
+### How I validate AI-assisted work
+
+I trace behavior through the code and confirm it with observable results instead of treating generated explanations as proof:
+
+1. I compare each requirement with its route, controller, service, workflow, activity, and Redis implementation.
+2. I use `npm run typecheck` to check TypeScript changes and the Postman collection to exercise successful searches, deduplication, price bounds, invalid input, supplier responses, and health status.
+3. For orchestration behavior, I inspect the Temporal Web UI workflow input, task queue, overlapping supplier activity timeline, event history, activity outputs, and final result. I compare the selected offers with the static supplier fixtures.
+4. When a check fails, I reproduce the specific request, follow its correlation ID through logs and the relevant layer, inspect Temporal history or Redis behavior when applicable, make a focused change, and rerun the relevant checks.
+
+The Postman collection and Temporal screenshots in this repository make those checks reviewable. AI helped me move faster through planning, code review, and documentation; the evidence and final engineering decisions come from the code, checks, and observed runtime behavior.
