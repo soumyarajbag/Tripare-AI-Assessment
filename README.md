@@ -20,29 +20,107 @@ Client → Express API → Temporal Workflow → [Supplier A Activity ‖ Suppli
 
 ---
 
-## Quick Start (Docker)
+## Assessment Deployment (Docker Compose)
+
+This Compose deployment runs the complete assessment stack: the Express API and mock supplier routes, a separate Temporal worker, Temporal Server, PostgreSQL for Temporal history, Redis for hotel offers, and the Temporal Web UI.
+
+### Prerequisites and configuration
+
+- Git and Docker Desktop (Windows/macOS) or Docker Engine with the Docker Compose plugin (Linux).
+- Make sure host ports `3000`, `6379`, `7233`, and `8080` are available. PostgreSQL is reachable only inside the Compose network and does not publish a host port.
+- No supplier credentials, API keys, or `.env` file are required for this mock-data deployment. Compose supplies the service hostnames and settings. `.env.example` is a reference for local development; the app does not load it automatically.
+
+### Deploy the stack
+
+1. Clone the repository and move into its root directory:
+
+   ```bash
+   git clone <your-github-repository-url>
+   cd hotel-offer-orchestrator
+   ```
+
+2. Build the production Docker image and start all services in the background:
+
+   ```bash
+   docker compose up --build -d
+   ```
+
+   The API and worker use the same `Dockerfile` image with different roles (`ROLE=api` and `ROLE=worker`). Compose starts PostgreSQL and Redis first, waits for Temporal and Redis health checks before starting the API, then starts the worker.
+
+3. Check that the services are running and inspect startup logs if needed:
+
+   ```bash
+   docker compose ps
+   docker compose logs --tail=100 temporal api worker
+   ```
+
+   Temporal may take around 30 seconds to initialise on the first start. Wait until the API is running and its dependencies are ready before sending requests.
+
+4. Verify the application health endpoint:
+
+   ```bash
+   curl --fail-with-body http://localhost:3000/health
+   ```
+
+   A fully ready stack returns HTTP `200` and `"status":"healthy"`, with `supplierA`, `supplierB`, `temporal`, and `redis` each marked `"status":"up"`. The endpoint returns `207` for a degraded stack and `503` when Temporal or Redis is unavailable.
+
+### Verify the assessment requirements
+
+Use Postman or curl to confirm the aggregation and filtering behavior:
 
 ```bash
-# 1. Clone the repository
-git clone <repo-url>
-cd hotel-offer-orchestrator
+# First uncached request: starts the Temporal workflow and populates Redis
+curl -i "http://localhost:3000/api/hotels?city=delhi"
 
-# 2. Start everything
-docker compose up --build
+# Repeat: should be served from Redis (X-Cache: HIT)
+curl -i "http://localhost:3000/api/hotels?city=delhi"
 
-# 3. Wait ~30s for Temporal to initialise, then test
-curl http://localhost:3000/health
-curl "http://localhost:3000/api/hotels?city=delhi"
+# Inclusive price filter, applied through Redis ZRANGEBYSCORE
+curl -i "http://localhost:3000/api/hotels?city=delhi&minPrice=4000&maxPrice=9000"
+
+# Unknown city returns HTTP 200 with []
+curl -i "http://localhost:3000/api/hotels?city=unknowncity"
 ```
 
-Compose starts the API and Temporal worker, a Temporal server backed by PostgreSQL, Redis, and the Temporal UI. PostgreSQL and Redis data use named volumes.
+On an uncached city, expect `X-Cache: MISS` and a Temporal run ID when available. The response contains one best-priced offer per hotel name; the repeated request should return `X-Cache: HIT`. If the city already has a cache entry, the first request may also be a cache hit. The default cache TTL is five minutes.
 
-**Services:**
-| Service | URL |
-|---|---|
-| API | http://localhost:3000 |
-| Temporal Web UI | http://localhost:8080 |
-| Redis | localhost:6379 |
+To run the included request assertions, import [`postman/HotelOfferOrchestrator.postman_collection.json`](postman/HotelOfferOrchestrator.postman_collection.json) into Postman, leave or set the `base_url` collection variable to `http://localhost:3000`, and run the collection. Run the health request first to confirm readiness. The collection covers deduplication, price filters, cache hits, validation failures, empty results, raw supplier responses, and the optional direct supplier-outage checks.
+
+Verify orchestration in [Temporal Web UI](http://localhost:8080): select namespace `default`, open **Workflows**, and inspect a run such as `hotel-aggregator-delhi`. Confirm workflow type `HotelAggregatorWorkflow`, task queue `hotel-offer-queue`, both supplier activities, and the final result. The [Temporal UI walkthrough](#temporal-ui-demo-walkthrough) below explains each screenshot.
+
+You can also inspect the Redis sorted-set query directly:
+
+```bash
+docker compose exec redis redis-cli --raw ZRANGEBYSCORE hotel:delhi:prices 4000 9000
+```
+
+The result is the serialized selected-hotel entries whose prices are between 4,000 and 9,000, inclusive.
+
+### Service addresses
+
+| Service | Address | Use |
+|---|---|---|
+| API | `http://localhost:3000` | Hotel API, supplier mocks, and `/health` |
+| Temporal Web UI | `http://localhost:8080` | Inspect workflow executions and event history |
+| Temporal gRPC | `localhost:7233` | Temporal client/worker connection |
+| Redis | `localhost:6379` | Cache inspection from the host |
+| PostgreSQL | Compose-internal only | Temporal persistence; no host port is published |
+
+### Logs and shutdown
+
+Follow service logs while debugging startup or requests:
+
+```bash
+docker compose logs -f api worker temporal redis postgres
+```
+
+Stop the containers and network when finished:
+
+```bash
+docker compose down
+```
+
+This keeps the named Redis and PostgreSQL volumes, so cached data and Temporal history remain for the next start. To remove those volumes and reset local state as well, run `docker compose down --volumes`.
 
 ## Temporal UI Demo Walkthrough
 
