@@ -122,6 +122,133 @@ docker compose down
 
 This keeps the named Redis and PostgreSQL volumes, so cached data and Temporal history remain for the next start. To remove those volumes and reset local state as well, run `docker compose down --volumes`.
 
+## AWS Deployment (Amazon EC2)
+
+This procedure runs the existing Docker Compose stack on one Ubuntu EC2 instance. It is suitable for an assessment demo: the hotel API is reachable over HTTP, while Redis, Temporal gRPC, and the Temporal UI stay private to the instance. For a public production service, put the API behind HTTPS and add authentication and monitoring.
+
+### 1. Launch an EC2 instance
+
+In the [EC2 console](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/EC2_GetStarted.html), choose a region close to the users (for example, Mumbai, `ap-south-1`, for an India-based demo), then launch an instance with:
+
+- **AMI:** Ubuntu Server 24.04 LTS, 64-bit x86.
+- **Instance type:** `t3.large` (2 vCPUs and 8 GiB memory), which leaves room for Temporal, PostgreSQL, Redis, the API, and the worker on one host. See [T3 instance specifications](https://aws.amazon.com/ec2/instance-types/t3/).
+- **Storage:** 40 GiB General Purpose SSD (`gp3`); keep **Delete on termination** enabled for the root volume unless you intend to retain it.
+- **Key pair:** create or select an SSH key pair and download the private key. Keep it private; it is used only to connect to the instance.
+- **Public IPv4:** enable assignment so Postman can reach the API.
+
+Ubuntu's default SSH username is `ubuntu`. Check the [EC2 launch and connect guide](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/tutorial-launch-a-test-ec2-instance.html) if you choose a different AMI.
+
+### 2. Configure the EC2 security group
+
+Add inbound rules for:
+
+| Port | Source | Purpose |
+|---|---|---|
+| TCP 22 | Your current public IP only | SSH administration |
+| TCP 3000 | The reviewer/client IPs, or `0.0.0.0/0` for a publicly accessible assessment demo | Hotel API and mock supplier endpoints |
+
+If you use IPv6, add the matching IPv6 rule for port 3000. Do **not** add public rules for ports `6379` (Redis), `7233` (Temporal gRPC), `8080` (Temporal UI), or `5432` (PostgreSQL). EC2 security groups act as the instance firewall; see [AWS security group rules](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/security-group-rules-reference.html).
+
+### 3. Connect and install Docker Compose
+
+From a terminal on your computer, connect using the downloaded key (replace the key filename and public IP):
+
+```bash
+ssh -i hotel-offer-key.pem ubuntu@<EC2-PUBLIC-IP>
+```
+
+On the EC2 instance, install Docker Engine and its Compose plugin using Docker's [official Ubuntu package repository](https://docs.docker.com/engine/install/ubuntu/):
+
+```bash
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
+  $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+```
+
+Confirm both commands are available:
+
+```bash
+docker --version
+docker compose version
+```
+
+The commands below use `sudo` so you do not need to add the `ubuntu` account to Docker's privileged group.
+
+### 4. Keep internal service ports private, then deploy
+
+Clone your GitHub repository onto the instance. For a private repository, configure an SSH deploy key on the instance rather than putting a GitHub token in a command or README.
+
+```bash
+git clone <your-github-repository-url>
+cd hotel-offer-orchestrator
+```
+
+Before starting the stack, edit `docker-compose.yml` on the instance and bind the three non-public host ports to loopback. Change their `ports` entries as follows; leave the API mapping as `"3000:3000"` and leave PostgreSQL unpublished:
+
+```yaml
+temporal:
+  ports:
+    - "127.0.0.1:7233:7233"
+temporal-ui:
+  ports:
+    - "127.0.0.1:8080:8080"
+redis:
+  ports:
+    - "127.0.0.1:6379:6379"
+```
+
+Build and start the services:
+
+```bash
+sudo docker compose up --build -d
+sudo docker compose ps
+sudo docker compose logs --tail=100 temporal api worker
+```
+
+Wait for the API and worker to become healthy/started. The first Temporal startup can take around 30 seconds while it initializes its PostgreSQL schema. No supplier API keys or other external credentials are needed; the supplier endpoints use the project's local fixtures.
+
+### 5. Verify the public API
+
+Replace `<EC2-PUBLIC-IP>` with the instance's public IPv4 address:
+
+```bash
+curl -i "http://<EC2-PUBLIC-IP>:3000/health"
+curl -i "http://<EC2-PUBLIC-IP>:3000/api/hotels?city=delhi"
+curl -i "http://<EC2-PUBLIC-IP>:3000/api/hotels?city=delhi&minPrice=4000&maxPrice=9000"
+```
+
+The health endpoint should report the API dependencies and both mock suppliers as up. The hotel response should contain the deduplicated best-priced offers; the bounded request applies the price range in Redis. In Postman, set the `base_url` collection variable to `http://<EC2-PUBLIC-IP>:3000` and run the collection.
+
+### 6. Open Temporal Web UI through an SSH tunnel
+
+The UI is intentionally not exposed to the internet. From your local computer, open an SSH tunnel and keep that terminal session running:
+
+```bash
+ssh -i hotel-offer-key.pem -N -L 8080:127.0.0.1:8080 ubuntu@<EC2-PUBLIC-IP>
+```
+
+Then visit [http://localhost:8080](http://localhost:8080), select namespace `default`, and inspect the workflow as described in the [Temporal UI walkthrough](#temporal-ui-demo-walkthrough). The same SSH tunnel can be closed when you are done.
+
+### Updating or removing the deployment
+
+To deploy a newer commit, SSH into the instance and run:
+
+```bash
+cd hotel-offer-orchestrator
+git pull
+sudo docker compose up --build -d
+```
+
+To stop the containers, run `sudo docker compose down` in the repository directory. This does not stop EC2 billing. When the demo is finished, terminate the instance in the EC2 console and check for any retained EBS volumes, snapshots, or Elastic IPs. AWS documents [instance termination and attached-volume behavior here](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/how-ec2-instance-termination-works.html).
+
 ## Temporal UI Demo Walkthrough
 
 The screenshots below show a completed `HotelAggregatorWorkflow` execution in the Temporal Web UI. To follow the same flow yourself, start the Docker Compose stack, then send `GET http://localhost:3000/api/hotels?city=mumbai` from Postman or curl. On a cache miss, the API starts the workflow and waits for its result. The result is then written to Redis. A later request served from Redis does not create a new workflow execution, so use a city whose cache has expired (the default TTL is five minutes) when you want to watch a fresh run.
